@@ -44,6 +44,182 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
+def round_multiple(x, m):
+    return (x + m - 1) // m * m
+
+
+def get_max_headdim():
+    """
+    Translates the inline C++ function get_max_headdim() into Python.
+    We simulate the #ifndef checks by passing in booleans.
+    """
+    return 256
+
+def round_up_headdim(head_size):
+    """
+    Translates the inline C++ function round_up_headdim(int head_size) into Python.
+    """
+    if head_size <= 64:
+        return 64
+    if head_size <= 96:
+        return 96
+    if head_size <= 128:
+        return 128
+    if head_size <= 192:
+        return 192
+    if head_size <= 256:
+        return 256
+    return 256
+
+# Reader: this Python function is written in this unusual way on purpose,
+# so that aligns as closely as possible the with variable names, logic, and
+# style of the c++ function ~100 lines of flash_api.cpp::mha_bwd. This is in order
+# to make it easy to update this function when the c++ function changes,
+# and easy to verify it is _exactly_ identical. Please do not rewrite this
+# function to make it look like readable python
+def mha_bwd_shapes(
+    q,                 # (b, s_q, h, d) or (total_q, h, d) if varlen
+    k,                 # (b, s_k, h_k, d) or (total_k, h_k, d) if varlen
+    softmax_lse,       # (b, h, s_q) or (h, total_q) if varlen
+    cu_seqlens_q=None, # optional tensor (b+1)
+    cu_seqlens_k=None, # optional tensor (b+1)
+    seqused_q=None,    # optional
+    seqused_k=None,    # optional
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+    is_causal=False,
+    window_size_left=0,
+    window_size_right=0,
+    softcap=0.0,
+):
+    """
+    Translates the C++ function bwd_shapes(...) into Python.
+
+    Returns a list [seqlen_q_rounded, seqlen_k_rounded, total_q_padded_rounded,
+                    total_k_padded_rounded, head_size_rounded].
+    """
+
+    # Determine whether we have "varlen" input
+    is_varlen_q = cu_seqlens_q is not None
+    is_varlen_k = cu_seqlens_k is not None
+    is_varlen   = is_varlen_q or is_varlen_k or (seqused_q is not None) or (seqused_k is not None)
+
+    # Extract shapes
+    if not is_varlen_q:
+        # (b, s_q, h, d)
+        batch_size = q.size(0)
+        seqlen_q   = q.size(1)
+        total_q    = batch_size * seqlen_q
+    else:
+        # (total_q, h, d)
+        batch_size = cu_seqlens_q.size(0) - 1
+        seqlen_q   = max_seqlen_q
+        total_q    = q.size(0)
+
+    num_heads   = q.size(-2)
+    head_size   = q.size(-1)
+
+    if not is_varlen_k:
+        # (b, s_k, h_k, d)
+        seqlen_k = k.size(1)
+        total_k  = batch_size * seqlen_k
+    else:
+        # (total_k, h_k, d)
+        seqlen_k = max_seqlen_k
+        total_k  = k.size(0)
+
+    num_heads_k = k.size(-2)
+
+    # Adjust window sizes & causal
+    if window_size_left >= seqlen_k - 1:
+        window_size_left = -1
+    if window_size_right >= seqlen_q - 1:
+        window_size_right = -1
+    if is_causal:
+        window_size_right = 0
+
+    is_causal = window_size_left < 0 and window_size_right == 0
+
+    major, minor = torch.cuda.get_device_capability()
+    arch = 10 * major + minor
+
+
+    # Round up head_size
+    head_size_rounded = round_up_headdim(head_size)
+
+    # If not causal but window_size_left < 0, window_size_right == 0,
+    # the backend might forcibly treat it as causal. For simplicity, keep the same logic:
+    is_local = (window_size_left >= 0 or window_size_right >= 0) and not is_causal
+
+    # Derive kBlockM, kBlockN based on architecture and head_size_rounded
+
+    # Boolean equivalent
+    is_local = ((window_size_left >= 0) or (window_size_right >= 0)) and (not is_causal)
+
+    # kBlockM_sm90
+    kBlockM_sm90 = (
+        (96 if (is_causal and softcap > 0.0) else 128) if head_size_rounded <= 64 else
+        (
+            64 if head_size_rounded <= 96 else
+            (
+                (64 if (is_causal or is_local or softcap > 0.0) else 80) if head_size_rounded <= 128 else 64
+            )
+        )
+    )
+
+    # kBlockM_sm80
+    kBlockM_sm80 = 128 if head_size_rounded <= 64 else 64
+
+    # kBlockM_sm86
+    kBlockM_sm86 = 64 if head_size_rounded <= 192 else 32
+
+    # kBlockM
+    kBlockM = (
+        kBlockM_sm90 if arch >= 90 else
+        (kBlockM_sm86 if arch == 86 or arch == 89 else kBlockM_sm80)
+    )
+
+    # kBlockN_sm90
+    kBlockN_sm90 = (
+        128 if head_size_rounded <= 128 else
+        (96 if head_size_rounded <= 192 else 80)
+    )
+
+    # kBlockN_sm80
+    kBlockN_sm80 = (
+        128 if head_size_rounded <= 128 else
+        (80 if head_size_rounded <= 192 else 64)
+    )
+
+    # kBlockN_sm86
+    kBlockN_sm86 = (
+        128 if head_size_rounded <= 64 else
+        (
+            128 if head_size_rounded <= 96 else
+            (
+                96 if head_size_rounded <= 128 else
+                (
+                    64 if head_size_rounded <= 192 else 64
+                )
+            )
+        )
+    )
+
+    # kBlockN
+    kBlockN = (
+        kBlockN_sm90 if arch >= 90 else
+        (kBlockN_sm86 if (arch == 86 or arch == 89) else kBlockN_sm80)
+    )
+
+    # Rounding calculations
+    seqlen_q_rounded         = round_multiple(seqlen_q, kBlockM)
+    seqlen_k_rounded         = round_multiple(seqlen_k, kBlockN)
+    total_q_padded_rounded   = round_multiple(total_q + batch_size * kBlockM, kBlockM)
+    total_k_padded_rounded   = round_multiple(total_k + batch_size * kBlockN, kBlockN)
+
+    return seqlen_q_rounded, seqlen_k_rounded, total_q_padded_rounded, total_k_padded_rounded, head_size_rounded
+
+
 @_torch_custom_op_wrapper("flash_attn_interface::_flash_attn_forward", mutates_args=("out",), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -293,23 +469,21 @@ def _flash_attn_backward_fake(
         dk = torch.empty_like(k)
     if dv is None:
         dv = torch.empty_like(v)
-    seqlen_q_rounded, seqlen_k_rounded, total_q_padded_rounded, total_k_padded_rounded, head_size_rounded = (
-        flash_attn_3_cuda.backward_shapes(
-            q,
-            k,
-            softmax_lse,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            causal,
-            window_size_left,
-            window_size_right,
-            softcap,
+    seqlen_q_rounded, seqlen_k_rounded, total_q_padded_rounded, total_k_padded_rounded, head_size_rounded = mha_bwd_shapes(
+            q=q,
+            k=k,
+            softmax_lse=softmax_lse,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            is_causal=causal,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            softcap=softcap,
         )
-    )
     if cu_seqlens_q is None and cu_seqlens_k is None and seqused_q is None and seqused_k is None:
         batch_size, seqlen_q, num_heads, _ = q.shape
         softmax_d = torch.empty((batch_size, num_heads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
